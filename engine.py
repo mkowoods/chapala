@@ -20,8 +20,15 @@ import time
 #    import pyodbc as odbc
 #except ImportError:
 #    import pypyodbc as odbc #Fall back to pure python implementation to handle known error with 0SX 10.9
-import ceODBC as odbc
+#import ceODBC as odbc
 
+
+""""
+    References:
+        https://www.python.org/dev/peps/pep-0249/#cursor-objects
+        https://docs.python.org/2/library/sqlite3.html
+        https://www.sqlite.org/cli.html
+"""
 
 def ceiling(x):
     if x - int(x) < 0.00001:
@@ -29,6 +36,48 @@ def ceiling(x):
     else:
         return int(x) + 1
 
+
+
+class TextFile(object):
+    
+    def __init__(self, path, delimiter = ",", has_header = True, nrows = -1):
+        self.path = path
+        self.delimiter = delimiter
+        self.nrows = nrows
+        self.has_header = has_header
+    
+    def infer_coltype(self, col_idx):
+        
+        #run tests on column to estimate data type
+        #if col is numeric [0-9]+(.[0-9]+)?
+        #if col is date use date regex or below is_date function
+        #otherwise keep it as a string
+        from dateutil.parser import parse
+        
+        def is_date(string):
+            try: 
+                parse(string)
+                return "is a date"
+            except ValueError:
+                return "not a date"
+
+    def get_header(self):
+        if not self.has_header:
+            return []
+        with open(self.path, 'rb') as f:
+            csv_reader = csv.reader(f, delimiter=self.delimiter)
+            return csv_reader.next()
+
+            
+    def get_rows(self):
+        with open(self.path, 'rb') as f:
+            csv_reader = csv.reader(f, delimiter=self.delimiter)
+            if self.has_header:
+                csv_reader.next()
+            for line in csv_reader:
+                yield line
+
+        
 
 class Spreadsheet(object):
 
@@ -139,6 +188,135 @@ class Spreadsheet(object):
         return output
 
 
+class SQLDB(object):
+    """implements sql operations using the DB-API 2.0 specifications
+        can be sub-classed and extended to handle other DB Operations
+    """
+
+    def __init__(self, connection, auto_commit = False, run_interactive = True):
+        self.conn = connection
+        self.curs = self.conn.cursor()
+        self.auto_commit = auto_commit
+        self.run_interactive = run_interactive
+
+    def close_conn(self):
+        self.conn.close()
+
+    def commit(self):
+        self.conn.commit()
+
+    def tables_exists(self, table):
+        try:
+            self.curs.execute("SELECT * FROM %s"%table)
+            return True
+        except Exception:
+            return False
+
+
+    def create_table(self, table, col_names, col_types, get_sql = False):
+        sqlize_col_name = lambda name :  name.replace(' ', '_')
+        names_and_types = ', '.join(['%s %s'%(sqlize_col_name(name), type) for name, type in zip(col_names, col_types)])
+        sql_string = "CREATE TABLE %(table)s (%(names)s);"%{'table': table,
+                                                             'names': names_and_types}
+        if get_sql:
+            return sql_string
+        else:
+            self.run_sql(sql_string)
+
+    def drop_table(self, table, get_sql = False):
+        sql_string = "DROP TABLE %s" % table
+
+        if get_sql:
+            return  sql_string
+        else:
+            self.run_sql(sql_string)
+
+
+    def insert_rows(self, table, rows, get_sql=False):
+
+        sql_string = "INSERT INTO %(table)s VALUES (%(params)s);"
+        sql_string = sql_string%{'table': table,
+                                 'params': ', '.join(['?' for n in range(len(rows[0]))])}
+
+        if get_sql:
+            return sql_string
+        else:
+            self.run_sql(sql_string, rows)
+
+    def delete_rows(self, table, get_sql=False):
+        sql_string = "DELETE FROM %s" % table
+
+        if get_sql:
+            return sql_string
+        else:
+            self.run_sql(sql_string)
+
+    def run_sql(self, sql, data = None):
+        try:
+            if data:
+                self.curs.executemany(sql, data)
+            else:
+                self.curs.execute(sql)
+        except Exception as err:
+            #TODO: Dump sql to log and error message
+            self.conn.rollback()
+            if not self.run_interactive:
+                self.close_conn()
+            raise err
+        else:
+            if self.auto_commit:
+                self.commit()
+
+    def yield_rows(self, table):
+
+        sql_string = "SELECT * FROM %(table)s;"%{'table': table}
+        self.run_sql(sql_string)
+        i = 0
+        while True:
+            row = self.curs.fetchone()
+            if row:
+                yield row
+            else:
+                break
+
+    def import_file(self, table, source_yield_rows_func, batch_size = 10000, type = 'a'):
+        """imports file into table has two types 'a' and 'r', append and replace, respectively.
+            takes the source files yield_rows function and uploads the records in batches of size batch_size
+        """
+        if type == 'r':
+            raise  NotImplementedError
+        assert type in ['a', 'r']
+
+        process_next_batch = True
+
+        row_gen = source_yield_rows_func()
+
+        while process_next_batch:
+            batch = []
+            for i, row in enumerate(row_gen):
+                if i < (batch_size - 1):
+                    batch.append(row)
+                else:
+                    batch.append(row)
+                    break
+
+            if len(batch) < batch_size:
+                process_next_batch = False
+
+            if batch:
+                self.insert_rows(table, rows = batch)
+
+
+
+
+
+
+
+
+
+
+
+#TO Be deprecated
 class MicrosoftSQLServerDB(object):
     """
         Class for handling the connection to the Microsoft SQL Server Database
@@ -259,3 +437,12 @@ class MicrosoftSQLServerDB(object):
     def close_conn(self):
         self._db_conn.close()
 
+
+if __name__ == "__main__":
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    S = SQLDB(conn)
+    print S.create_table('persons', ['first', 'last', 'bday'], ['text', 'text', 'text'], get_sql = True)
+
+
+    S.close()
